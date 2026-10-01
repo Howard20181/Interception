@@ -1,0 +1,19 @@
+TARGETNAME=blockkey
+TARGETTYPE=PROGRAM
+UMTYPE=console
+
+USE_NATIVE_EH=1
+USE_MSVCRT=1
+USE_RTTI=1
+USE_STL=1
+386_STDCALL=0
+
+INCLUDES=..;..\..\library
+
+# For a 64 bit build, which is what 64 bit Windows needs, replace the library
+# below with ..\..\library\objfre_win7_amd64\amd64\interception.lib and set the
+# environment with the x64 variant used by library\buildit-x64.cmd:
+# %WDK%\bin\setenv %WDK% fre x64 WIN7 no_oacr
+# build-msvc.cmd in this directory already produces a 64 bit executable.
+TARGETLIBS=$(SDK_LIB_PATH)\user32.lib $(SDK_LIB_PATH)\advapi32.lib ..\..\library\objfre_wxp_x86\i386\interception.lib
+SOURCES=..\utils.c blockkey.cpp
