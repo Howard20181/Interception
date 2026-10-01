@@ -33,7 +33,7 @@ if not defined RES echo build-msvc.cmd: mc.exe/rc.exe not available, building wi
 cl /nologo /O2 /W3 /EHsc /DINTERCEPTION_STATIC /D_CRT_SECURE_NO_WARNINGS ^
    /I..\..\library /I.. ^
    blockkey.cpp ..\utils.c ..\..\library\interception.c %RES% ^
-   /Fe:blockkey.exe /link user32.lib advapi32.lib
+   /Fe:blockkey.exe /link user32.lib advapi32.lib ntdll.lib
 if errorlevel 1 goto :fail
 
 echo.

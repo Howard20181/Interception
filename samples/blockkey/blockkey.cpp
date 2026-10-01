@@ -51,7 +51,21 @@
 #define NOMINMAX
 #endif
 
+/* winnt.h defines a handful of STATUS_ codes that ntstatus.h defines again.
+ * This keeps them out of the way, which is what the SDK documentation
+ * prescribes for using NT status values in a user mode program. */
+#ifndef WIN32_NO_STATUS
+#define WIN32_NO_STATUS
+#endif
+
 #include <windows.h>
+
+#ifdef WIN32_NO_STATUS
+#undef WIN32_NO_STATUS
+#endif
+
+#include <ntstatus.h>
+#include <winternl.h>
 #include <aclapi.h>
 #include <sddl.h>
 
@@ -59,6 +73,35 @@
 #include <interception.h>
 
 using namespace std;
+
+/* The native calls that fold the keyboard and mouse device names, and the flag
+ * that makes those links outlive this program, are only declared by the
+ * driver development headers, so they are spelled out here.  They are stable
+ * and exported by ntdll.dll on every supported Windows. */
+#ifndef OBJ_PERMANENT
+#define OBJ_PERMANENT 0x00000010
+#endif
+
+#ifndef OBJ_CASE_INSENSITIVE
+#define OBJ_CASE_INSENSITIVE 0x00000040
+#endif
+
+#ifndef SYMBOLIC_LINK_ALL_ACCESS
+#define SYMBOLIC_LINK_ALL_ACCESS (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x0001)
+#endif
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(status) (((NTSTATUS)(status)) >= 0)
+#endif
+
+extern "C" NTSTATUS WINAPI NtCreateSymbolicLinkObject(PHANDLE link_handle,
+                                                      ACCESS_MASK desired_access,
+                                                      POBJECT_ATTRIBUTES object_attributes,
+                                                      PUNICODE_STRING target_name);
+extern "C" NTSTATUS WINAPI NtOpenSymbolicLinkObject(PHANDLE link_handle,
+                                                    ACCESS_MASK desired_access,
+                                                    POBJECT_ATTRIBUTES object_attributes);
+extern "C" NTSTATUS WINAPI NtMakeTemporaryObject(HANDLE handle);
 
 namespace {
 
@@ -97,6 +140,8 @@ struct Options {
     bool quiet;
     bool no_lockdown;       /* leave the driver's device access rights alone */
     bool unlock_driver;     /* give every user access to the driver again */
+    bool no_symlinks;       /* leave the driver's device names alone */
+    bool clear_symlinks;    /* remove the folded device names */
 };
 
 Options default_options() {
@@ -114,6 +159,8 @@ Options default_options() {
     options.quiet = false;
     options.no_lockdown = false;
     options.unlock_driver = false;
+    options.no_symlinks = false;
+    options.clear_symlinks = false;
     return options;
 }
 
@@ -395,17 +442,23 @@ void print_usage(ostream &out) {
         << "  --no-lockdown         leave the driver's device access rights alone\n"
         << "  --unlock              give every user access to the driver again, then\n"
         << "                        exit instead of swallowing a key\n"
+        << "  --no-symlinks         leave the driver's device names alone\n"
+        << "  --clear-symlinks      remove the folded device names, then exit\n"
         << "  -h, --help            print this help\n"
         << "\n"
         << "Right Alt is scan code 0x38 with the E0 prefix, left Alt the same scan\n"
         << "code without it.  Quit with left Ctrl + left Shift + Q.\n"
         << "\n"
         << "Started with administrator rights, or as the service, this program also\n"
-        << "restricts the Interception driver's control devices to SYSTEM and\n"
-        << "Administrators, silently and without a reboot, so that no unelevated\n"
-        << "process can read or inject keystrokes any more.  Unelevated runs then\n"
-        << "need administrator rights themselves; --unlock opens the driver up\n"
-        << "again, --no-lockdown leaves the rights untouched.\n";
+        << "keeps the driver in shape, silently and without a reboot:\n"
+        << "  - its control devices are restricted to SYSTEM and Administrators, so\n"
+        << "    no unelevated process can read or inject keystrokes any more\n"
+        << "    (unelevated runs then need administrator rights themselves),\n"
+        << "  - the keyboard and mouse device names are folded, so a device that is\n"
+        << "    unplugged, replugged or resumed from sleep cannot end up outside the\n"
+        << "    range the driver handles, which would leave it dead until a reboot.\n"
+        << "--unlock, --no-lockdown, --clear-symlinks and --no-symlinks turn that off\n"
+        << "or undo it, one half at a time.\n";
 }
 
 wstring widen(const char *text) {
@@ -483,6 +536,10 @@ int parse_options(int argc, char *argv[], Options &options) {
             options.no_lockdown = true;
         } else if (argument == "--unlock") {
             options.unlock_driver = true;
+        } else if (argument == "--no-symlinks") {
+            options.no_symlinks = true;
+        } else if (argument == "--clear-symlinks") {
+            options.clear_symlinks = true;
         } else if (argument == "-h" || argument == "--help") {
             return 1;
         } else {
@@ -784,6 +841,316 @@ bool apply_driver_access_policy(Session &session, bool service_mode) {
     return false;
 }
 
+/* -------------------------------------------------- device name folding -- */
+
+/* The free build of the Interception driver only ever handles the first ten
+ * KeyboardClass and PointerClass devices.  Windows numbers those names afresh
+ * for every enumeration, so after a few unplugs, replugs or resumes from sleep
+ * a device ends up outside that range: the filter has nothing to attach to, the
+ * strokes it swallows never reach the class driver either, and that keyboard or
+ * mouse stays dead until the next reboot - even with no interceptor running
+ * (oblitum/Interception issues 25 and 93).
+ *
+ * The repair is to pre-create symbolic links that fold every higher name back
+ * onto the first ten, so that wherever Windows counts up to, the name resolves
+ * to a device the driver does handle:
+ *
+ *     \Device\KeyboardClass10..999  ->  \Device\KeyboardClass0..9
+ *     \Device\PointerClass10..999   ->  \Device\PointerClass0..9
+ *
+ * The links are permanent kernel objects: they outlive this program and last
+ * until the machine reboots, which is why the service recreates them at every
+ * start.  The numbering also starts over with each boot, so folding the names
+ * once per boot covers every enumeration of that session.
+ *
+ * This is the same repair the third party "interception-driver-fix" applies.
+ * It needs no driver change and no reboot. */
+
+const int class_device_count = 1000;
+
+/* Links that could not be made permanent, kept open so that they stay alive
+ * for as long as this program runs. */
+vector<HANDLE> class_links_held_open;
+
+string decimal_text(unsigned long value) {
+    string text;
+
+    if (value == 0) return string("0");
+
+    while (value > 0) {
+        text = string(1, (char)('0' + (int)(value % 10))) + text;
+        value /= 10;
+    }
+
+    return text;
+}
+
+string hex_text(unsigned long value) {
+    const char *digits = "0123456789ABCDEF";
+    string text;
+    bool started = false;
+
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        unsigned long part = (value >> shift) & 0xF;
+
+        if (part != 0 || started || shift == 0) {
+            text += digits[part];
+            started = true;
+        }
+    }
+
+    return text;
+}
+
+/* The native calls take wide strings; device names are plain ASCII. */
+wstring wide_text(const string &text) {
+    wstring wide;
+
+    for (size_t i = 0; i < text.size(); ++i) wide += (wchar_t)(unsigned char)text[i];
+
+    return wide;
+}
+
+/* \Device\KeyboardClass10, \Device\PointerClass7, ... */
+string class_device_name(const char *class_name, int index) {
+    string name = "\\Device\\";
+
+    name += class_name;
+
+    return name + decimal_text((unsigned long)index);
+}
+
+/* How many names the folding covers, for one class. */
+int folded_class_device_count(int count) {
+    return (count / 10 - 1) * 10;
+}
+
+/* OBJ_PERMANENT needs SeCreatePermanentPrivilege: a service account has it
+ * enabled already, an administrator token usually has it but disabled. */
+bool enable_permanent_object_privilege() {
+    HANDLE token = 0;
+    TOKEN_PRIVILEGES privileges;
+    LUID identifier;
+    bool enabled = false;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return false;
+
+    if (LookupPrivilegeValueA(0, SE_CREATE_PERMANENT_NAME, &identifier)) {
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = identifier;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        if (AdjustTokenPrivileges(token, FALSE, &privileges, 0, 0, 0) && GetLastError() == ERROR_SUCCESS)
+            enabled = true;
+    }
+
+    CloseHandle(token);
+
+    return enabled;
+}
+
+/* Returns 1 when the name resolves from now on, 0 when it does not (failure
+ * then says why).  A link that could not be made permanent is handed back in
+ * held_handle, which the caller has to keep open for as long as the name has to
+ * resolve. */
+int create_class_device_link(const string &link_name, const string &target_name, bool permanent,
+                            HANDLE &held_handle, string &failure) {
+    wstring wide_link = wide_text(link_name);
+    wstring wide_target = wide_text(target_name);
+    UNICODE_STRING link_string;
+    UNICODE_STRING target_string;
+    OBJECT_ATTRIBUTES attributes;
+    HANDLE link_handle = 0;
+    NTSTATUS status;
+
+    held_handle = 0;
+
+    RtlInitUnicodeString(&link_string, wide_link.c_str());
+    RtlInitUnicodeString(&target_string, wide_target.c_str());
+
+    InitializeObjectAttributes(&attributes, &link_string, permanent ? OBJ_PERMANENT : 0, 0, 0);
+    status = NtCreateSymbolicLinkObject(&link_handle, SYMBOLIC_LINK_ALL_ACCESS, &attributes,
+                                        &target_string);
+
+    /* A name that is already a link of some kind is fine: an earlier run, or
+     * another tool, has done this part already. */
+    if (NT_SUCCESS(status) || status == STATUS_OBJECT_NAME_COLLISION ||
+        status == STATUS_OBJECT_TYPE_MISMATCH) {
+        if (link_handle) NtClose(link_handle);
+
+        return 1;
+    }
+
+    if (permanent && (status == STATUS_PRIVILEGE_NOT_HELD || status == STATUS_ACCESS_DENIED)) {
+        /* This token may not create a permanent object, but it may still create
+         * one that lasts as long as this program keeps the handle open. */
+        InitializeObjectAttributes(&attributes, &link_string, 0, 0, 0);
+        status = NtCreateSymbolicLinkObject(&link_handle, SYMBOLIC_LINK_ALL_ACCESS, &attributes,
+                                            &target_string);
+
+        if (NT_SUCCESS(status)) {
+            held_handle = link_handle;
+
+            return 1;
+        }
+
+        if (status == STATUS_OBJECT_NAME_COLLISION || status == STATUS_OBJECT_TYPE_MISMATCH) {
+            if (link_handle) NtClose(link_handle);
+
+            return 1;
+        }
+    }
+
+    if (link_handle) NtClose(link_handle);
+
+    if (failure.empty())
+        failure = "cannot create " + link_name + ", status 0x" + hex_text((unsigned long)status);
+
+    return 0;
+}
+
+/* Folds every higher class device name back onto the first ten.  permanent is
+ * an input and output: on entry it says whether permanent links are still
+ * possible, and it is cleared once the links only last for this run. */
+int fold_class_devices(const char *class_name, int count, bool &permanent, string &failure) {
+    int folded = 0;
+
+    for (int block = 10; block < count; block += 10) {
+        for (int low = 0; low < 10; ++low) {
+            string link_name = class_device_name(class_name, block + low);
+            string target_name = class_device_name(class_name, low);
+            HANDLE held = 0;
+
+            if (create_class_device_link(link_name, target_name, permanent, held, failure) == 0)
+                continue;
+
+            ++folded;
+
+            if (held) {
+                permanent = false;
+                class_links_held_open.push_back(held);
+            }
+        }
+    }
+
+    return folded;
+}
+
+/* Silently folds the keyboard and mouse device names when this run has the
+ * rights to do so, on the same rule as the access rights above. */
+bool apply_driver_name_repair(Session &session, bool service_mode) {
+    bool privileged = service_mode || process_is_elevated();
+    bool permanent = true;
+    string failure;
+    int wanted = folded_class_device_count(class_device_count) * 2;
+    int folded;
+
+    if (session.options.no_symlinks || !privileged) return true;
+
+    folded = fold_class_devices("KeyboardClass", class_device_count, permanent, failure);
+    folded += fold_class_devices("PointerClass", class_device_count, permanent, failure);
+
+    if (folded == wanted && permanent) return true;
+
+    if (folded == wanted) {
+        /* It works, but only for as long as this program runs, which the user
+         * cannot see from the outside. */
+        session.log_warning("blockkey: the driver's device names are folded only until this"
+                            " program exits, because this token may not create permanent"
+                            " objects");
+
+        return true;
+    }
+
+    string detail = number_text((unsigned long)folded) + " of " +
+                    number_text((unsigned long)wanted) + " device names";
+
+    if (!failure.empty()) detail += ": " + failure;
+
+    session.log_warning("blockkey: could not fold the driver's device names, " + detail);
+
+    return false;
+}
+
+int remove_class_device_links(const char *class_name, int count, string &failure) {
+    int removed = 0;
+
+    for (int block = 10; block < count; block += 10) {
+        for (int low = 0; low < 10; ++low) {
+            string link_name = class_device_name(class_name, block + low);
+            wstring wide_link = wide_text(link_name);
+            UNICODE_STRING link_string;
+            OBJECT_ATTRIBUTES attributes;
+            HANDLE link_handle = 0;
+            NTSTATUS status;
+
+            RtlInitUnicodeString(&link_string, wide_link.c_str());
+            InitializeObjectAttributes(&attributes, &link_string, OBJ_CASE_INSENSITIVE, 0, 0);
+
+            status = NtOpenSymbolicLinkObject(&link_handle, DELETE, &attributes);
+
+            /* Nothing to remove is the normal case on a machine that never had
+             * the names folded. */
+            if (status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_TYPE_MISMATCH)
+                continue;
+
+            if (!NT_SUCCESS(status)) {
+                if (failure.empty())
+                    failure = "cannot open " + link_name + ", status 0x" +
+                              hex_text((unsigned long)status);
+
+                continue;
+            }
+
+            /* A permanent object goes away as soon as it is no longer permanent
+             * and the last handle is closed. */
+            status = NtMakeTemporaryObject(link_handle);
+
+            if (NT_SUCCESS(status))
+                ++removed;
+            else if (failure.empty())
+                failure = "cannot remove " + link_name + ", status 0x" +
+                          hex_text((unsigned long)status);
+
+            NtClose(link_handle);
+        }
+    }
+
+    return removed;
+}
+
+/* --clear-symlinks: undo the folding and stop. */
+bool clear_driver_name_repair(Session &session) {
+    string failure;
+    int wanted = folded_class_device_count(class_device_count) * 2;
+    int removed = remove_class_device_links("KeyboardClass", class_device_count, failure);
+
+    removed += remove_class_device_links("PointerClass", class_device_count, failure);
+
+    if (removed == 0 && failure.empty()) {
+        session.log("blockkey: no folded device names to remove");
+
+        return true;
+    }
+
+    if (removed == wanted) {
+        session.log("blockkey: removed " + number_text((unsigned long)removed) +
+                    " folded device names, so the driver handles the first ten again");
+
+        return true;
+    }
+
+    string detail = number_text((unsigned long)removed) + " of " +
+                    number_text((unsigned long)wanted) + " device names";
+
+    if (!failure.empty()) detail += ": " + failure;
+
+    session.log_error("blockkey: could not remove all folded device names, " + detail);
+
+    return false;
+}
+
 /* Would any keyboard at all be affected by the configured filter?  A hardware
  * id that matches nothing looks exactly like a working setup that swallows
  * nothing, so it is worth saying out loud. */
@@ -948,8 +1315,10 @@ void WINAPI service_main(DWORD argc, char **argv) {
                             INTERCEPTION_FILTER_KEY_ALL);
 
     /* Started by the service control manager as SYSTEM, so this is the run that
-     * keeps the driver restricted to administrators across reboots. */
+     * keeps the driver restricted to administrators, and its device names
+     * folded, across reboots. */
     apply_driver_access_policy(service_session, true);
+    apply_driver_name_repair(service_session, true);
 
     warn_about_unmatched_keyboard(service_session);
 
@@ -1039,18 +1408,33 @@ int main(int argc, char *argv[]) {
         release_session.options = options;
 
         apply_driver_access_policy(release_session, false);
+        apply_driver_name_repair(release_session, false);
 
         return release_stuck_key(options);
     }
 
-    /* A maintenance action on its own: hand the driver back to every user and
-     * stop, instead of going on to swallow a key.  Runs before the context is
-     * created, so that it also works while the driver is restricted. */
-    if (options.unlock_driver && !options.service) {
-        Session unlock_session;
-        unlock_session.options = options;
+    /* Maintenance actions on their own: repair or undo the driver work and stop,
+     * instead of going on to swallow a key.  They run before the context is
+     * created, so that they also work while the driver is restricted. */
+    if ((options.unlock_driver || options.clear_symlinks) && !options.service) {
+        Session maintenance;
+        bool ok = true;
 
-        return apply_driver_access_policy(unlock_session, false) ? 0 : 1;
+        maintenance.options = options;
+
+        if (options.unlock_driver) {
+            bool step = apply_driver_access_policy(maintenance, false);
+
+            ok = ok && step;
+        }
+
+        if (options.clear_symlinks) {
+            bool step = clear_driver_name_repair(maintenance);
+
+            ok = ok && step;
+        }
+
+        return ok ? 0 : 1;
     }
 
     if (options.service) return run_as_service(options);
@@ -1077,9 +1461,11 @@ int main(int argc, char *argv[]) {
                             INTERCEPTION_FILTER_KEY_ALL);
 
     /* Silently, when this run has the rights: nothing unelevated keeps watching
-     * the keyboard or injecting strokes through the driver.  Runs before the
-     * handles this program already holds are used, and leaves them alone. */
+     * the keyboard or injecting strokes through the driver, and a device that
+     * is unplugged, replugged or resumed from sleep cannot go dead.  Runs after
+     * the handles this program already holds are open, and leaves them alone. */
     apply_driver_access_policy(session, false);
+    apply_driver_name_repair(session, false);
 
     if (options.list) {
         list_keyboards(session.context, session.cache);

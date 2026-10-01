@@ -27,9 +27,9 @@ if not defined COMPILER (
 )
 
 echo building the host side test with %COMPILER%
-if "%COMPILER%"=="cl" cl /nologo /W3 /EHsc /D_CRT_SECURE_NO_WARNINGS /I..\.. /I..\..\..\library blockkey_test.cpp /Fe:blockkey_test.exe /link advapi32.lib
-if "%COMPILER%"=="g++" g++ -std=c++03 -Wall -Wextra -I..\.. -I..\..\..\library blockkey_test.cpp -o blockkey_test.exe -ladvapi32
-if "%COMPILER%"=="clang++" clang++ -std=c++03 -Wall -Wextra -I..\.. -I..\..\..\library blockkey_test.cpp -o blockkey_test.exe -ladvapi32
+if "%COMPILER%"=="cl" cl /nologo /W3 /EHsc /D_CRT_SECURE_NO_WARNINGS /I..\.. /I..\..\..\library blockkey_test.cpp /Fe:blockkey_test.exe /link advapi32.lib ntdll.lib
+if "%COMPILER%"=="g++" g++ -std=c++03 -Wall -Wextra -I..\.. -I..\..\..\library blockkey_test.cpp -o blockkey_test.exe -ladvapi32 -lntdll
+if "%COMPILER%"=="clang++" clang++ -std=c++03 -Wall -Wextra -I..\.. -I..\..\..\library blockkey_test.cpp -o blockkey_test.exe -ladvapi32 -lntdll
 
 if errorlevel 1 (
     echo run-tests.cmd: the test did not build

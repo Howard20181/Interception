@@ -255,9 +255,11 @@ Run run_blockkey(const vector<string> &arguments,
 
     for (size_t i = 0; i < arguments.size(); ++i) all.push_back(arguments[i]);
 
-    /* No test may change the real driver's access rights, not even when the
-     * suite happens to be run from an elevated prompt. */
+    /* No test may change the real driver's access rights or create real device
+     * names, not even when the suite happens to be run from an elevated
+     * prompt. */
     all.push_back("--no-lockdown");
+    all.push_back("--no-symlinks");
 
     vector<char *> argv;
     for (size_t i = 0; i < all.size(); ++i) argv.push_back(const_cast<char *>(all[i].c_str()));
@@ -607,6 +609,69 @@ static void test_the_lockdown_options_are_parsed() {
     CHECK(options.no_lockdown);
 }
 
+static void test_the_device_names_fold_onto_the_first_ten() {
+    /* The names the folding covers, and the names it points them at. */
+    CHECK(class_device_name("KeyboardClass", 0) == "\\Device\\KeyboardClass0");
+    CHECK(class_device_name("KeyboardClass", 9) == "\\Device\\KeyboardClass9");
+    CHECK(class_device_name("KeyboardClass", 10) == "\\Device\\KeyboardClass10");
+    CHECK(class_device_name("PointerClass", 999) == "\\Device\\PointerClass999");
+    CHECK(class_device_name("PointerClass", 1000) == "\\Device\\PointerClass1000");
+
+    /* 10..999 in steps of ten, ten names each. */
+    CHECK(folded_class_device_count(1000) == 990);
+    CHECK(folded_class_device_count(20) == 10);
+
+    /* Every folded name points back at the same last digit, which is inside
+     * 0..9 - the whole point, since the driver only handles the first ten. */
+    const string prefix = "\\Device\\KeyboardClass";
+
+    for (int index = 10; index < 1000; index += 7) {
+        string link = class_device_name("KeyboardClass", index);
+        string target = class_device_name("KeyboardClass", index % 10);
+
+        CHECK(link.compare(0, prefix.size(), prefix) == 0);
+        CHECK(target == prefix + decimal_text((unsigned long)(index % 10)));
+        CHECK(link != target);
+    }
+
+    /* The two helpers the messages and the names are built from. */
+    CHECK(decimal_text(0) == "0");
+    CHECK(decimal_text(7) == "7");
+    CHECK(decimal_text(10) == "10");
+    CHECK(decimal_text(999) == "999");
+    CHECK(hex_text(0) == "0");
+    CHECK(hex_text(0x34) == "34");
+    CHECK(hex_text(0xC0000034ul) == "C0000034");
+}
+
+static void test_the_symlink_options_are_parsed() {
+    Options options = default_options();
+    char program[] = "blockkey";
+    char no_symlinks[] = "--no-symlinks";
+    char clear_symlinks[] = "--clear-symlinks";
+    char *untouched[2];
+    char *cleared[2];
+
+    untouched[0] = program;
+    untouched[1] = no_symlinks;
+
+    cleared[0] = program;
+    cleared[1] = clear_symlinks;
+
+    CHECK(parse_options(2, untouched, options) == 0);
+    CHECK(options.no_symlinks);
+    CHECK(!options.clear_symlinks);
+
+    options = default_options();
+
+    CHECK(parse_options(2, cleared, options) == 0);
+    CHECK(options.clear_symlinks);
+    CHECK(!options.no_symlinks);
+
+    CHECK(!default_options().no_symlinks);
+    CHECK(!default_options().clear_symlinks);
+}
+
 int main() {
     test_right_alt_is_swallowed_and_the_rest_passes_through();
     test_a_stuck_key_repeating_is_fully_swallowed();
@@ -625,6 +690,8 @@ int main() {
     test_the_driver_access_policy_follows_the_flags();
     test_the_two_device_dacls_are_well_formed();
     test_the_lockdown_options_are_parsed();
+    test_the_device_names_fold_onto_the_first_ten();
+    test_the_symlink_options_are_parsed();
 
     cout << (checks - failures) << "/" << checks << " checks passed" << endl;
 

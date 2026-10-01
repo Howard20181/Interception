@@ -21,5 +21,5 @@ INCLUDES=..;..\..\library
 #   rc /nologo /fo blockkey.res blockkey.rc
 # and add blockkey.res to the compiler inputs above.  Without it the service
 # still writes events, only without their descriptive text.
-TARGETLIBS=$(SDK_LIB_PATH)\user32.lib $(SDK_LIB_PATH)\advapi32.lib ..\..\library\objfre_wxp_x86\i386\interception.lib
+TARGETLIBS=$(SDK_LIB_PATH)\user32.lib $(SDK_LIB_PATH)\advapi32.lib $(SDK_LIB_PATH)\ntdll.lib ..\..\library\objfre_wxp_x86\i386\interception.lib
 SOURCES=..\utils.c blockkey.cpp

@@ -50,7 +50,7 @@ if not defined RES echo build-msvc-dll.cmd: mc.exe/rc.exe not available, buildin
 cl /nologo /O2 /W3 /EHsc /D_CRT_SECURE_NO_WARNINGS ^
    /I ..\..\library /I .. ^
    blockkey.cpp ..\utils.c %RES% ^
-   /Fe:%OUT% /link "%LIBDIR%\interception.lib" user32.lib advapi32.lib
+   /Fe:%OUT% /link "%LIBDIR%\interception.lib" user32.lib advapi32.lib ntdll.lib
 if errorlevel 1 goto :fail
 
 copy /y "%LIBDIR%\interception.dll" . >nul
