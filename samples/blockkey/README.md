@@ -31,9 +31,11 @@ blockkey —— 屏蔽某一个按键
    路径：`install-driver.cmd "D:\path\install-interception.exe"`（这种带参数的情况需要
    管理员命令行，见下面的"关于提权"）。卸载用 `uninstall-driver.cmd`，同样走官方
    `/uninstall`，同样要重启。
-2. 本程序**通常需要管理员身份**运行，否则可能打不开驱动，会提示
-   `cannot reach the Interception driver`。实测本机在非管理员下也能打开驱动设备，
-   所以先直接运行即可，真打不开时再用管理员运行。
+2. 本程序**通常需要管理员身份**运行：它一旦拿到管理员权限（或作为服务以 SYSTEM 启动）
+   就会把驱动设备收紧成"仅管理员可打开"（见下面的"驱动权限"一节），之后非管理员运行会
+   提示 `cannot reach the Interception driver` 并在提示里说明设备已被收紧。实测本机驱动
+   刚装好时非管理员也能打开，所以第一次直接运行即可；之后的运行用管理员，或先用
+   `--no-lockdown` / `--unlock` 保持开放。
 3. 这是进程级的拦截：程序不在运行时不会屏蔽任何按键，坏键会恢复原样。
 
 编译
@@ -126,7 +128,38 @@ blockkey --help                完整选项
 | `--service` | 以 Windows 服务方式运行，由服务控制管理器启动，不要手动敲 |
 | `--verbose` | 打印每个被吞掉的按键 |
 | `--quiet` | 除错误外不打印 |
+| `--no-lockdown` | 不动驱动的设备访问权限（见下节） |
+| `--unlock` | 把驱动设备重新对所有用户开放，然后退出（维护用） |
 | `-h`, `--help` | 帮助 |
+
+驱动权限：有权限时自动收紧
+--------------------------
+
+Interception 驱动创建的 20 个控制设备（`\\.\interception00`…`19`）默认对 **Everyone**
+开放读写，所以任何**非管理员**进程——包括跑在低完整性下的沙箱进程——都能读取全部键盘
+输入、也能注入按键。设备对象的 DACL 里 Everyone 的掩码是 `0x001201BF`（泛读/泛写/执行，
+但不含 `WRITE_DAC`），所以只有 SYSTEM 和管理员能改它。
+
+于是本程序**只要已经拿到足够的权限，就顺手把它收紧**：
+
+- **以管理员身份运行**，或**作为服务启动**（服务控制管理器以 SYSTEM 启动它）时，程序会
+  静默地把这 20 个设备的 DACL 改成只允许 **SYSTEM 和 Administrators**：
+  `D:P(A;;GA;;;SY)(A;;GA;;;BA)`；
+- **不需要重启、不需要改驱动**：设备对象原地收紧；
+- **自己不受影响**：改动前程序已经打开了这 20 个句柄，已打开的句柄不会因 DACL 变化失效
+  （这一点用等价实验验证过：同一个 SDDL、同一个 `SE_KERNEL_OBJECT` 对象类型，设置成功 →
+  新的打开被拒 `error 5` → 旧句柄照旧可用）；
+- **持续到驱动重新加载**（重启）或有人执行 `--unlock` 为止。装成服务后，服务每次开机都会
+  重新收紧一次，所以是长期生效的。
+
+代价要知道：
+
+- 收紧之后，**非管理员**的运行会失败并提示
+  `its devices are restricted to administrators, so run this program as administrator`。
+  包括 `--list`、`--probe`、普通屏蔽运行，以及急救脚本——急救脚本因此改成了自己弹 UAC；
+- 其它以非管理员身份使用该驱动的工具（例如 AutoHotInterception）也会一起被挡住，
+  需要时用管理员执行一次 `blockkey --unlock` 放开；
+- 不想让它动权限，就加 `--no-lockdown`（保持 Everyone 可用的原状）。
 
 典型用法
 --------
@@ -262,12 +295,18 @@ samples\blockkey\tests\run-tests.cmd
 ```
 
 测试用桩替换 Interception API，把脚本化的按键序列喂给程序本体，检查哪些被吞掉、哪些
-被透传、参数解析和退出组合键是否正确，共 60 项断言，MSVC、clang++、g++ 都能跑。
+被透传、参数解析、退出组合键，以及驱动权限策略的判定和两个 DACL 的合法性，共 114 项
+断言，MSVC、clang++、g++ 都能跑。测试里会强制带上 `--no-lockdown`，所以**即使从管理员
+命令行跑测试也不会改动机器上驱动的实际权限**。
 
 常见问题
 --------
 
-- `cannot reach the Interception driver`：驱动没装，或没用管理员身份运行。
+- `cannot reach the Interception driver`：驱动没装，或权限不够。程序会区分这两种情况：
+  提示里出现 `its devices are restricted to administrators` 就说明驱动装好了、只是已被
+  收紧成"仅管理员"，用管理员身份运行即可（要放开就执行一次管理员权限的
+  `blockkey --unlock`）；提示 `install it and run this program as administrator` 才是驱动
+  没装。
 - `another instance is already running`：已经有一个 blockkey 在运行（单实例互斥）。
 - **Alt/Ctrl 卡住不放，命令行里按 Enter 变成切换全屏、命令不执行**：这是 Windows 认为
   那个修饰键还按着，命令行就把 Enter 当成了 Alt+Enter。原因是坏键在**没有任何过滤**的
@@ -275,7 +314,8 @@ samples\blockkey\tests\run-tests.cmd
   三种解法：
   1. 敲一下**另一侧**的同名键（左 Alt）通常就能释放；
   2. 按 Ctrl+Alt+Del 进安全注意序列，也会重置修饰键状态；
-  3. 用本程序的急救脚本（**双击即可，不需要键盘操作**，服务在跑时也能用）：
+  3. 用本程序的急救脚本（**双击即可，不需要键盘操作**，服务在跑时也能用；它会自己弹
+     UAC 请求管理员权限，因为驱动设备通常已被收紧成仅管理员可打开）：
 
      ```
      samples\blockkey\release-stuck-key.cmd

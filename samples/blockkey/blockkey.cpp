@@ -23,6 +23,14 @@
  * console and no keyboard of its own, is stopped with "sc stop blockkey"
  * instead, and writes what it does to the Windows event log rather than to a
  * file of its own.
+ *
+ * Whenever this program already has the rights to do so - it runs elevated, or
+ * as the service, which the service control manager starts as SYSTEM - it also
+ * restricts the Interception driver's control devices to SYSTEM and
+ * Administrators, silently, so that no unelevated process can watch or inject
+ * keystrokes any more.  Nothing has to be restarted for that: the devices are
+ * restricted in place.  --unlock puts the permissive rights back, --no-lockdown
+ * leaves them alone.  See the README for what that means for unelevated runs.
  */
 
 #include <cstdlib>
@@ -44,6 +52,8 @@
 #endif
 
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 
 #include <utils.h>
 #include <interception.h>
@@ -85,6 +95,8 @@ struct Options {
     bool probe;
     bool verbose;
     bool quiet;
+    bool no_lockdown;       /* leave the driver's device access rights alone */
+    bool unlock_driver;     /* give every user access to the driver again */
 };
 
 Options default_options() {
@@ -100,8 +112,14 @@ Options default_options() {
     options.probe = false;
     options.verbose = false;
     options.quiet = false;
+    options.no_lockdown = false;
+    options.unlock_driver = false;
     return options;
 }
+
+/* Defined with the driver access helpers further down, and needed as soon as a
+ * context cannot be created. */
+string driver_access_hint();
 
 bool is_key_up(const InterceptionKeyStroke &kstroke) {
     return (kstroke.state & INTERCEPTION_KEY_UP) != 0;
@@ -232,8 +250,7 @@ int release_stuck_key(const Options &options) {
 
     context = interception_create_context();
     if (!context) {
-        cerr << "blockkey: cannot reach the Interception driver; install it and run this"
-                " program as administrator" << endl;
+        cerr << "blockkey: cannot reach the Interception driver; " << driver_access_hint() << endl;
         return 1;
     }
 
@@ -375,10 +392,20 @@ void print_usage(ostream &out) {
         << "                        control manager, not from a command line\n"
         << "  --verbose             print every swallowed keystroke\n"
         << "  --quiet               print nothing but errors\n"
+        << "  --no-lockdown         leave the driver's device access rights alone\n"
+        << "  --unlock              give every user access to the driver again, then\n"
+        << "                        exit instead of swallowing a key\n"
         << "  -h, --help            print this help\n"
         << "\n"
         << "Right Alt is scan code 0x38 with the E0 prefix, left Alt the same scan\n"
-        << "code without it.  Quit with left Ctrl + left Shift + Q.\n";
+        << "code without it.  Quit with left Ctrl + left Shift + Q.\n"
+        << "\n"
+        << "Started with administrator rights, or as the service, this program also\n"
+        << "restricts the Interception driver's control devices to SYSTEM and\n"
+        << "Administrators, silently and without a reboot, so that no unelevated\n"
+        << "process can read or inject keystrokes any more.  Unelevated runs then\n"
+        << "need administrator rights themselves; --unlock opens the driver up\n"
+        << "again, --no-lockdown leaves the rights untouched.\n";
 }
 
 wstring widen(const char *text) {
@@ -452,6 +479,10 @@ int parse_options(int argc, char *argv[], Options &options) {
             options.verbose = true;
         } else if (argument == "--quiet") {
             options.quiet = true;
+        } else if (argument == "--no-lockdown") {
+            options.no_lockdown = true;
+        } else if (argument == "--unlock") {
+            options.unlock_driver = true;
         } else if (argument == "-h" || argument == "--help") {
             return 1;
         } else {
@@ -500,6 +531,150 @@ bool report_event(WORD type, DWORD id, const string &text) {
     strings[0] = text.c_str();
 
     return ReportEventA(event_source, type, 0, id, 0, 1, 0, strings, 0) != 0;
+}
+
+/* ------------------------------------------------- driver access rights -- */
+
+/* The Interception driver creates its twenty control devices with a DACL that
+ * grants Everyone generic read and write, so any local process - including one
+ * running at low integrity, such as a sandboxed browser renderer - can watch
+ * every keystroke and inject its own.  Changing that needs no driver change and
+ * no reboot, only the right to write the DACL, which SYSTEM and Administrators
+ * already have on these devices.
+ *
+ * So whenever a run of this program has those rights anyway, it restricts the
+ * devices to SYSTEM and Administrators and says nothing while doing so: the
+ * point is that this program keeps working exactly as before while everything
+ * that is not elevated loses access.  --unlock puts the permissive DACL back,
+ * --no-lockdown leaves the devices alone. */
+
+const char *restricted_device_sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+const char *permissive_device_sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)";
+
+enum DriverAccessAction {
+    access_leave_alone = 0,
+    access_restrict,
+    access_open_up
+};
+
+/* What this run should do to the driver's access rights.  A service is started
+ * by the service control manager as a SYSTEM account, which is not "elevated"
+ * in the UAC sense of a filtered administrator token, yet may change the DACL
+ * all the same. */
+DriverAccessAction driver_access_action(const Options &options, bool privileged) {
+    if (options.unlock_driver) return access_open_up;
+    if (options.no_lockdown) return access_leave_alone;
+    if (privileged) return access_restrict;
+
+    return access_leave_alone;
+}
+
+/* True when the effective token is an administrator one: the membership check
+ * looks at the filtered token, so an administrator who did not confirm the UAC
+ * prompt is not counted. */
+bool process_is_elevated() {
+    SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
+    PSID administrators = 0;
+    BOOL member = FALSE;
+    bool elevated = false;
+
+    if (!AllocateAndInitializeSid(&authority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                  DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &administrators))
+        return false;
+
+    if (CheckTokenMembership(0, administrators, &member)) elevated = member != FALSE;
+
+    FreeSid(administrators);
+
+    return elevated;
+}
+
+/* The library opens "\\.\interception00" up to "...19"; the same names are
+ * spelled out here by hand, so that nothing has to be formatted. */
+string device_name_of(int index) {
+    string name = "\\\\.\\interception";
+
+    name += (char)('0' + index / 10);
+    name += (char)('0' + index % 10);
+
+    return name;
+}
+
+/* Applies one DACL to all twenty control devices.  Returns how many of them
+ * were changed, and in failure what went wrong first. */
+int set_device_access(const char *sddl, string &failure) {
+    PSECURITY_DESCRIPTOR descriptor = 0;
+    PACL dacl = 0;
+    BOOL dacl_present = FALSE;
+    BOOL dacl_defaulted = FALSE;
+    int changed = 0;
+
+    failure.clear();
+
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            sddl, SDDL_REVISION_1, &descriptor, 0)) {
+        failure = "cannot build a security descriptor, error " +
+                  number_text((unsigned long)GetLastError());
+
+        return 0;
+    }
+
+    if (!GetSecurityDescriptorDacl(descriptor, &dacl_present, &dacl, &dacl_defaulted) ||
+        !dacl_present) {
+        LocalFree(descriptor);
+        failure = "the security descriptor carries no DACL";
+
+        return 0;
+    }
+
+    for (int index = 0; index < INTERCEPTION_MAX_DEVICE; ++index) {
+        string name = device_name_of(index);
+        HANDLE device = CreateFileA(name.c_str(), WRITE_DAC | READ_CONTROL,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+        DWORD result;
+
+        if (device == INVALID_HANDLE_VALUE) {
+            if (failure.empty())
+                failure = "cannot open " + name + ", error " +
+                          number_text((unsigned long)GetLastError());
+
+            continue;
+        }
+
+        result = SetSecurityInfo(device, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, 0, 0, dacl, 0);
+        CloseHandle(device);
+
+        if (result == ERROR_SUCCESS)
+            ++changed;
+        else if (failure.empty())
+            failure = "cannot set the access rights of " + name + ", error " +
+                      number_text((unsigned long)result);
+    }
+
+    LocalFree(descriptor);
+
+    return changed;
+}
+
+/* Why the Interception driver could not be used, in the words the user needs:
+ * without this a driver restricted to administrators looks exactly like one
+ * that is not installed at all. */
+string driver_access_hint() {
+    HANDLE probe = CreateFileA(device_name_of(0).c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+
+    if (probe != INVALID_HANDLE_VALUE) {
+        CloseHandle(probe);
+
+        return "install it and run this program as administrator";
+    }
+
+    if (GetLastError() == ERROR_ACCESS_DENIED)
+        return "its devices are restricted to administrators, so run this program as"
+               " administrator, or open them up again with an elevated"
+               " \"blockkey --unlock\"";
+
+    return "install it and run this program as administrator";
 }
 
 /* ------------------------------------------------------------ logging -- */
@@ -572,6 +747,42 @@ struct Session {
         if (file) file << timestamp() << " " << line << endl;
     }
 };
+
+/* Restricts, or opens up, the driver's control devices when this run already
+ * has the rights to do so.  Silent while it works; returns false when the
+ * requested change could not be applied to all twenty devices. */
+bool apply_driver_access_policy(Session &session, bool service_mode) {
+    DriverAccessAction action =
+        driver_access_action(session.options, service_mode || process_is_elevated());
+    string failure;
+    int changed;
+
+    if (action == access_leave_alone) return true;
+
+    changed = set_device_access(
+        (action == access_restrict) ? restricted_device_sddl : permissive_device_sddl, failure);
+
+    if (changed == INTERCEPTION_MAX_DEVICE) {
+        /* Restricting is deliberately silent, only --unlock announces itself. */
+        if (action == access_open_up)
+            session.log("blockkey: the Interception driver is open to every user again");
+
+        return true;
+    }
+
+    string detail = number_text((unsigned long)changed) + " of " +
+                    number_text((unsigned long)INTERCEPTION_MAX_DEVICE) + " devices";
+
+    if (!failure.empty()) detail += ": " + failure;
+
+    if (action == access_restrict)
+        session.log_warning("blockkey: could not restrict the Interception driver to"
+                            " administrators, " + detail);
+    else
+        session.log_error("blockkey: could not open up the Interception driver, " + detail);
+
+    return false;
+}
 
 /* Would any keyboard at all be affected by the configured filter?  A hardware
  * id that matches nothing looks exactly like a working setup that swallows
@@ -736,6 +947,10 @@ void WINAPI service_main(DWORD argc, char **argv) {
     interception_set_filter(service_session.context, interception_is_keyboard,
                             INTERCEPTION_FILTER_KEY_ALL);
 
+    /* Started by the service control manager as SYSTEM, so this is the run that
+     * keeps the driver restricted to administrators across reboots. */
+    apply_driver_access_policy(service_session, true);
+
     warn_about_unmatched_keyboard(service_session);
 
     if (service_session.options.release)
@@ -819,7 +1034,24 @@ int main(int argc, char *argv[]) {
         return 2;
     }
 
-    if (options.release_only) return release_stuck_key(options);
+    if (options.release_only) {
+        Session release_session;
+        release_session.options = options;
+
+        apply_driver_access_policy(release_session, false);
+
+        return release_stuck_key(options);
+    }
+
+    /* A maintenance action on its own: hand the driver back to every user and
+     * stop, instead of going on to swallow a key.  Runs before the context is
+     * created, so that it also works while the driver is restricted. */
+    if (options.unlock_driver && !options.service) {
+        Session unlock_session;
+        unlock_session.options = options;
+
+        return apply_driver_access_policy(unlock_session, false) ? 0 : 1;
+    }
 
     if (options.service) return run_as_service(options);
 
@@ -834,8 +1066,7 @@ int main(int argc, char *argv[]) {
 
     session.context = interception_create_context();
     if (!session.context) {
-        cerr << "blockkey: cannot reach the Interception driver; install it and run this"
-                " program as administrator" << endl;
+        cerr << "blockkey: cannot reach the Interception driver; " << driver_access_hint() << endl;
         close_single_program(program_instance);
         return 1;
     }
@@ -844,6 +1075,11 @@ int main(int argc, char *argv[]) {
 
     interception_set_filter(session.context, interception_is_keyboard,
                             INTERCEPTION_FILTER_KEY_ALL);
+
+    /* Silently, when this run has the rights: nothing unelevated keeps watching
+     * the keyboard or injecting strokes through the driver.  Runs before the
+     * handles this program already holds are used, and leaves them alone. */
+    apply_driver_access_policy(session, false);
 
     if (options.list) {
         list_keyboards(session.context, session.cache);

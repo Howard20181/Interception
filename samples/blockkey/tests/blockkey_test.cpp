@@ -255,6 +255,10 @@ Run run_blockkey(const vector<string> &arguments,
 
     for (size_t i = 0; i < arguments.size(); ++i) all.push_back(arguments[i]);
 
+    /* No test may change the real driver's access rights, not even when the
+     * suite happens to be run from an elevated prompt. */
+    all.push_back("--no-lockdown");
+
     vector<char *> argv;
     for (size_t i = 0; i < all.size(); ++i) argv.push_back(const_cast<char *>(all[i].c_str()));
 
@@ -523,6 +527,86 @@ static void test_bad_arguments_are_rejected() {
     CHECK(help.exit_code == 0);
 }
 
+static void test_the_driver_access_policy_follows_the_flags() {
+    Options plain = default_options();
+    Options no_lockdown = default_options();
+    Options unlock = default_options();
+
+    no_lockdown.no_lockdown = true;
+    unlock.unlock_driver = true;
+
+    /* An unelevated console run touches nothing, a privileged one restricts. */
+    CHECK(driver_access_action(plain, false) == access_leave_alone);
+    CHECK(driver_access_action(plain, true) == access_restrict);
+
+    /* --no-lockdown wins even when the rights would be there. */
+    CHECK(driver_access_action(no_lockdown, false) == access_leave_alone);
+    CHECK(driver_access_action(no_lockdown, true) == access_leave_alone);
+
+    /* --unlock is the one request an unelevated run still attempts, so that it
+     * says why it could not instead of staying quiet. */
+    CHECK(driver_access_action(unlock, false) == access_open_up);
+    CHECK(driver_access_action(unlock, true) == access_open_up);
+}
+
+static void test_the_two_device_dacls_are_well_formed() {
+    const char *sddls[2];
+    int expected_aces[2];
+    int i;
+
+    sddls[0] = restricted_device_sddl;   /* SYSTEM and Administrators */
+    sddls[1] = permissive_device_sddl;   /* and Everyone, as Interception has it */
+
+    expected_aces[0] = 2;
+    expected_aces[1] = 3;
+
+    for (i = 0; i < 2; ++i) {
+        PSECURITY_DESCRIPTOR descriptor = 0;
+        PACL dacl = 0;
+        BOOL present = FALSE;
+        BOOL defaulted = FALSE;
+
+        CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorA(
+                  sddls[i], SDDL_REVISION_1, &descriptor, 0) != 0);
+
+        if (!descriptor) continue;
+
+        CHECK(GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) != 0);
+        CHECK(present != FALSE);
+        CHECK(defaulted == FALSE);
+
+        if (dacl) CHECK(dacl->AceCount == expected_aces[i]);
+
+        LocalFree(descriptor);
+    }
+}
+
+static void test_the_lockdown_options_are_parsed() {
+    Options options = default_options();
+    char program[] = "blockkey";
+    char unlock[] = "--unlock";
+    char no_lockdown[] = "--no-lockdown";
+    char *only_unlock[2];
+    char *both[3];
+
+    only_unlock[0] = program;
+    only_unlock[1] = unlock;
+
+    both[0] = program;
+    both[1] = no_lockdown;
+    both[2] = unlock;
+
+    CHECK(parse_options(2, only_unlock, options) == 0);
+    CHECK(options.unlock_driver);
+    CHECK(!options.no_lockdown);
+
+    options = default_options();
+
+    CHECK(parse_options(3, both, options) == 0);
+    CHECK(options.unlock_driver);
+    CHECK(options.no_lockdown);
+}
+
 int main() {
     test_right_alt_is_swallowed_and_the_rest_passes_through();
     test_a_stuck_key_repeating_is_fully_swallowed();
@@ -538,6 +622,9 @@ int main() {
     test_release_only_frees_a_stuck_key_without_blocking();
     test_an_unmatched_hardware_id_is_reported();
     test_bad_arguments_are_rejected();
+    test_the_driver_access_policy_follows_the_flags();
+    test_the_two_device_dacls_are_well_formed();
+    test_the_lockdown_options_are_parsed();
 
     cout << (checks - failures) << "/" << checks << " checks passed" << endl;
 

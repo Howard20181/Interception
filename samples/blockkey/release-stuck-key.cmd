@@ -9,12 +9,29 @@ REM
 REM     release-stuck-key.cmd           five seconds of probing
 REM     release-stuck-key.cmd 10        ten seconds instead
 REM
-REM Needs the Interception driver; administrator rights are not normally needed,
-REM but if the driver cannot be reached, right click this file and run it as
-REM administrator.
+REM It asks for administrator rights itself: a running blockkey has restricted
+REM the driver's devices to administrators, so an unelevated run could not reach
+REM them.  Started with an argument, run it from an elevated command prompt
+REM instead, since options are not forwarded through the UAC prompt.
 
 setlocal
 pushd "%~dp0"
+
+REM ------------------------------------------------- administrator rights --
+whoami /groups | findstr /c:"S-1-16-12288" >nul
+if errorlevel 1 (
+    if not "%~1"=="" (
+        echo release-stuck-key.cmd: with an argument, open a command prompt started
+        echo                         as administrator and run this there
+        popd
+        exit /b 1
+    )
+    echo release-stuck-key.cmd: asking for administrator rights
+    powershell -NoProfile -Command "Start-Process -FilePath cmd.exe -ArgumentList '/k','\"%~f0\"' -Verb RunAs" 2>nul
+    if errorlevel 1 echo release-stuck-key.cmd: administrator rights were refused, nothing was done
+    popd
+    exit /b 1
+)
 
 set "SECONDS=%~1"
 if "%SECONDS%"=="" set "SECONDS=5"
@@ -38,9 +55,9 @@ echo release-stuck-key.cmd: sending the key up now
 "%~dp0blockkey.exe" --release-only
 if errorlevel 1 (
     echo.
-    echo release-stuck-key.cmd: that did not work.  If it mentions the driver or
-    echo                        administrator rights, right click this file and
-    echo                        run it as administrator.
+    echo release-stuck-key.cmd: that did not work.  The most likely reasons are
+    echo                        that blockkey.exe is missing next to this script,
+    echo                        or that the Interception driver is not installed.
 )
 
 echo.
