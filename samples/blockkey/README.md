@@ -17,8 +17,20 @@ blockkey —— 屏蔽某一个按键
 先决条件
 --------
 
-1. 已安装 Interception 驱动（release 包里的 `install-interception.exe`，用管理员
-   身份运行，装完重启）。
+1. 已安装 Interception 驱动。把 release 里的 `install-interception.exe`（在
+   "command line installer" 目录里）放到本目录旁边，然后运行：
+
+   ```
+   samples\blockkey\install-driver.cmd
+   ```
+
+   **直接双击就行**：脚本发现没有管理员权限时会自己弹 UAC 请求提权，提权后的副本在独立
+   窗口里继续，而且窗口会保留（`cmd /k`）让你看清结果；拒绝 UAC 则什么都不做。脚本调用
+   官方安装器的 `/install`，再核对 `keyboard.sys`、`mouse.sys` 和键盘/鼠标类的过滤器
+   注册是否就位，最后提示重启——**重启后驱动才真正开始过滤**。也可以在命令行上给安装器
+   路径：`install-driver.cmd "D:\path\install-interception.exe"`（这种带参数的情况需要
+   管理员命令行，见下面的"关于提权"）。卸载用 `uninstall-driver.cmd`，同样走官方
+   `/uninstall`，同样要重启。
 2. 本程序**通常需要管理员身份**运行，否则可能打不开驱动，会提示
    `cannot reach the Interception driver`。实测本机在非管理员下也能打开驱动设备，
    所以先直接运行即可，真打不开时再用管理员运行。
@@ -35,11 +47,17 @@ samples\blockkey\build-msvc.cmd
 
 脚本自己找 Visual Studio（vswhere + VsDevCmd），把 `library\interception.c` 一起编进
 可执行文件，所以运行时**不需要** `interception.dll`，只依赖已安装的驱动（实测依赖只有
-`ADVAPI32.dll`、`KERNEL32.dll`）。在 VS 开发者命令行里也可以手动编译：
+`ADVAPI32.dll`、`KERNEL32.dll`）。构建过程本身不写任何日志。
+
+事件日志的消息表（`blockkey.mc`）**是可选的**：脚本在 `PATH` 上找得到 SDK 的
+`mc.exe`/`rc.exe` 时就顺手编进 exe（这样事件查看器能显示完整描述），找不到就跳过并给出
+提示，exe 照常能用。手动编译时对应下面两步：
 
 ```
+mc -h . -r . blockkey.mc          :: 可选，需要 Windows SDK
+rc /nologo /fo blockkey.res blockkey.rc
 cl /O2 /EHsc /DINTERCEPTION_STATIC /I ..\..\library /I .. ^
-   blockkey.cpp ..\utils.c ..\..\library\interception.c /Fe:blockkey.exe ^
+   blockkey.cpp ..\utils.c ..\..\library\interception.c blockkey.res /Fe:blockkey.exe ^
    /link user32.lib advapi32.lib
 ```
 
@@ -102,6 +120,7 @@ blockkey --help                完整选项
 | `--hardware-id <文本>` | 只对硬件 ID 含该文本的键盘生效（不区分大小写，别名 `--hwid`） |
 | `--release` | 启动时补发一次抬起，释放已卡住的状态（默认） |
 | `--no-release` | 只吞事件，绝不发送任何东西 |
+| `--release-only` | 只补发一次抬起就退出（急救用：坏键把 Alt/Ctrl 卡住时） |
 | `--probe` | 打印每个按键（键盘编号、扫描码、state、是否 E0、硬件 ID），不拦截 |
 | `--list` | 列出键盘设备与硬件 ID 后退出 |
 | `--service` | 以 Windows 服务方式运行，由服务控制管理器启动，不要手动敲 |
@@ -159,29 +178,67 @@ blockkey --key 0x52 --e0
 
 | 做法 | 何时生效 | 需要管理员 | 运行日志 |
 | --- | --- | --- | --- |
-| 装成 Windows 服务（推荐） | 开机时，登录前 | 仅安装/卸载时 | `%ProgramData%\blockkey\blockkey.log` |
+| 装成 Windows 服务（推荐） | 开机时，登录前 | 仅安装/卸载时 | Windows 事件日志（应用程序日志，source `blockkey`） |
 | 计划任务（开机触发） | 开机时，登录前 | 仅安装/卸载时 | 无 |
 | 启动文件夹 / 登录触发 | 登录之后 | 不需要 | 无（会留一个黑窗口） |
 
-安装成服务（管理员命令提示符，参数会原样存进服务）：
+安装成服务：**不带参数时直接双击**（脚本自己弹 UAC 提权）；要带参数就先用管理员命令
+提示符打开，例如：
 
 ```
 samples\blockkey\install-service.cmd
 samples\blockkey\install-service.cmd --hardware-id "VID_2717&PID_5011&REV_0100&MI_00"
 ```
 
-脚本会执行 `sc create`（`start= auto`、以 LocalSystem 运行、命令行里带 `--service`
-和你给的参数）、写描述、设置崩溃后自动重启，然后立即启动服务。之后：
+脚本做三件事：把**运行文件复制到标准位置** `%ProgramFiles%\blockkey`（只会复制
+`blockkey.exe`、`interception.dll` 和 `README.txt`，脚本本身留在原处）、`sc create` 指向
+那份副本（`start= auto`、LocalSystem、命令行带 `--service` 和你给的参数，并设置崩溃后
+自动重启）、注册事件日志源，然后立即启动。之后原文件夹挪走也不影响已装好的服务。
+
+想装到别处就设环境变量（不要在末尾加反斜杠）：
+
+```
+set BLOCKKEY_INSTALL_DIR=D:\tools\blockkey
+samples\blockkey\install-service.cmd
+```
+
+管理：
 
 ```
 sc query blockkey                                  查看状态
 sc stop blockkey                                   停止，右 Alt 立刻恢复
 sc start blockkey                                  再次启动
-samples\blockkey\uninstall-service.cmd             停止并删除
+samples\blockkey\uninstall-service.cmd             停止、删除服务，并清掉安装目录里的程序文件
 ```
 
-- 服务没有控制台，所以运行情况写进日志文件：启动参数、补发抬起的键盘数、停止时吞掉的
-  按键总数。服务模式下 `--verbose` 不逐条记录，免得一个卡住的键把日志写爆。
+卸载只删它自己复制过去的那三个文件；如果那个目录里还有别的东西，目录会保留；如果检测到
+程序是"原地安装"（安装目录就是脚本所在目录，例如旧版本装的），它会保留文件不动。升级同理：
+`sc stop blockkey` → 覆盖安装目录里的 `blockkey.exe`/`interception.dll` → `sc start blockkey`，
+路径没变就不用重装服务。
+
+安装目录的要求（默认值已经满足）：必须是**本地固定盘**、放在只有管理员能写的目录里——网络
+共享、映射盘、U 盘都不行（服务在会话 0、开机时启动，那时没有网络和盘映射），非系统盘的
+BitLocker 卷也可能在开机时尚未解锁；默认的 `%ProgramFiles%\blockkey` 正好避开这些坑。
+
+- 服务没有控制台，所以运行情况写进 **Windows 事件日志**：启动参数、补发抬起的键盘数、
+  停止时吞掉的按键总数。安装脚本会把这个源注册到
+  `HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\blockkey` 并指向
+  `blockkey.exe`（消息表就编在 exe 里，由 `blockkey.mc` 经 `mc.exe`/`rc.exe` 生成）。
+  查看方式：
+
+  ```
+  eventvwr.msc                                  事件查看器 -> Windows 日志 -> 应用程序
+  Get-WinEvent -ProviderName blockkey           或 PowerShell
+  ```
+
+  日志大小由系统管：应用程序日志默认上限 20 MB、写满自动覆盖最旧的（可在事件查看器里
+  改）。程序自己不写任何日志文件；只有在**打不开事件日志**这种异常情况下，才会退回写
+  `%ProgramData%\blockkey\blockkey.log`。
+- **只有由服务控制管理器启动的服务实例会写事件日志**。命令行的各种模式（`--list`、
+  `--probe`、普通屏蔽运行，以及手动敲 `blockkey.exe --service`）一律只打印到控制台 /
+  stderr，不碰事件日志；构建过程同样不写日志。
+- 日志因此不会无限增长：正常一次开关机只有 2–3 条事件，卡住的键也**不会**逐条记录
+  （服务模式下 `--verbose` 不生效），只在停止时记一个总数。
 - 退出组合键 Ctrl + Shift + Q 只对控制台运行有效；服务用 `sc stop blockkey` 停。
 - 服务与手动运行互斥：服务在跑时再手动运行会提示 `another instance is already running`，
   这是有意的（两个实例会分散键盘事件）。
@@ -212,10 +269,37 @@ samples\blockkey\tests\run-tests.cmd
 
 - `cannot reach the Interception driver`：驱动没装，或没用管理员身份运行。
 - `another instance is already running`：已经有一个 blockkey 在运行（单实例互斥）。
+- **Alt/Ctrl 卡住不放，命令行里按 Enter 变成切换全屏、命令不执行**：这是 Windows 认为
+  那个修饰键还按着，命令行就把 Enter 当成了 Alt+Enter。原因是坏键在**没有任何过滤**的
+  时候被系统记成了"按下"（程序/服务没在跑，或 `--hardware-id` 没匹配到任何键盘）。
+  三种解法：
+  1. 敲一下**另一侧**的同名键（左 Alt）通常就能释放；
+  2. 按 Ctrl+Alt+Del 进安全注意序列，也会重置修饰键状态；
+  3. 用本程序的急救脚本（**双击即可，不需要键盘操作**，服务在跑时也能用）：
+
+     ```
+     samples\blockkey\release-stuck-key.cmd
+     samples\blockkey\release-stuck-key.cmd 10      :: probe 窗口改成 10 秒
+     ```
+
+     它会先跑几秒 `--probe`，把键盘此刻在上报什么原样打印出来（方便确认坏键到底在发
+     哪个扫描码），然后向所有键盘补发配置键两种 E0 变体的抬起事件。只想补发、不看
+     probe 的话可以直接用 `blockkey.exe --release-only`。
+  根治办法是让它一直跑（装成服务，见上一节）；服务启动时的补发抬起也会清掉开机过程中
+  已经卡住的状态。另外程序现在会在启动时自检：`--hardware-id`/`--device` 没有匹配到
+  任何键盘时会明确提示 `no keyboard matches ... nothing will be swallowed`，以免"看起来
+  在跑其实什么都没拦"。
 - `--service must be started by the service control manager`：`--service` 只给服务用，
-  手动运行不要加它（这条错误也会记进服务日志文件）。
-- 服务起不来：先看 `%ProgramData%\blockkey\blockkey.log`；再确认驱动已装、并且
-  `blockkey.exe --list` 能正常列出键盘。
+  手动运行不要加它（这条错误也会作为 source `blockkey` 的事件记进应用程序日志）。
+- **关于提权**：安装/卸载类脚本（`install-driver.cmd`、`install-service.cmd` 等）在没有
+  管理员权限时会自己弹 UAC；但**带参数**时它们不通过 UAC 边界转发参数，而是提示你用管理员
+  命令行运行——因为 cmd 在展开 `%*` 时会重新解析元字符，硬件 ID 里的 `&` 一定会被拆坏
+  （`set BLOCKKEY_INSTALL_DIR` 时同理，避免静默装到默认目录）。所以：
+  - 双击 = 立即提权，使用默认设置；
+  - 要传 `--hardware-id "VID_xxxx&PID_xxxx..."` 这类参数，先开一个管理员命令提示符再运行。
+- 服务起不来：在事件查看器的应用程序日志里按 source `blockkey` 筛（或
+  `Get-WinEvent -ProviderName blockkey`）；再确认驱动已装、并且 `blockkey.exe --list`
+  能正常列出键盘。
 - 屏蔽之后 Alt 似乎还是“按着”的：说明按键在启动前已被系统认定为按下，而补发的抬起没
   生效。用 `--verbose` 确认事件确实被吞掉了，必要时重启后再启动本程序。
 - 想确认它真的在工作：加 `--verbose`，按一下坏键会打印 `swallowed ...`。

@@ -38,9 +38,18 @@ call "%VSPATH%\Common7\Tools\VsDevCmd.bat" -arch=%ARCH% -no_logo
 if errorlevel 1 goto :fail
 
 :build
+REM The event log message table is nice to have, not required: without it the
+REM service still journals, only without a readable description.  mc.exe and
+REM rc.exe come with the Windows SDK; building touches no log either way.
+set "RES="
+mc -h . -r . blockkey.mc >nul 2>nul
+if not errorlevel 1 rc /nologo /fo blockkey.res blockkey.rc >nul 2>nul
+if exist blockkey.res set "RES=blockkey.res"
+if not defined RES echo build-msvc-dll.cmd: mc.exe/rc.exe not available, building without the event log message table
+
 cl /nologo /O2 /W3 /EHsc /D_CRT_SECURE_NO_WARNINGS ^
    /I ..\..\library /I .. ^
-   blockkey.cpp ..\utils.c ^
+   blockkey.cpp ..\utils.c %RES% ^
    /Fe:%OUT% /link "%LIBDIR%\interception.lib" user32.lib advapi32.lib
 if errorlevel 1 goto :fail
 

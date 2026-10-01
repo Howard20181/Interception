@@ -15,5 +15,11 @@ INCLUDES=..;..\..\library
 # environment with the x64 variant used by library\buildit-x64.cmd:
 # %WDK%\bin\setenv %WDK% fre x64 WIN7 no_oacr
 # build-msvc.cmd in this directory already produces a 64 bit executable.
+# The event log message table in blockkey.mc is not built by this file.  To
+# embed it, generate and compile it first:
+#   mc -h . -r . blockkey.mc
+#   rc /nologo /fo blockkey.res blockkey.rc
+# and add blockkey.res to the compiler inputs above.  Without it the service
+# still writes events, only without their descriptive text.
 TARGETLIBS=$(SDK_LIB_PATH)\user32.lib $(SDK_LIB_PATH)\advapi32.lib ..\..\library\objfre_wxp_x86\i386\interception.lib
 SOURCES=..\utils.c blockkey.cpp

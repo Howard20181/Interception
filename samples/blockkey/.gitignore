@@ -8,3 +8,10 @@
 # Copied next to blockkey-dll.exe by build-msvc-dll.cmd; the real library lives
 # in library\x64 and library\x86 (both already ignored by the root .gitignore).
 *.dll
+
+# Generated from blockkey.mc by mc.exe and rc.exe, to embed the event log
+# message table in the executable.
+blockkey.h
+blockkey.rc
+blockkey.res
+MSG*.bin

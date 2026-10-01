@@ -45,6 +45,10 @@ static vector<InterceptionKeyStroke> forwarded;
 static vector<InterceptionDevice> forwarded_devices;
 static map<InterceptionDevice, wstring> hardware_ids;
 
+/* Set to false to pretend another instance already holds the single program
+ * lock. */
+static bool single_program_available = true;
+
 InterceptionContext interception_create_context(void) {
     return (InterceptionContext)1;
 }
@@ -140,7 +144,7 @@ void lower_process_priority(void) {}
 void *try_open_single_program(const char *name) {
     (void)name;
 
-    return (void *)1;
+    return single_program_available ? (void *)1 : 0;
 }
 
 void close_single_program(void *program_instance) {
@@ -181,6 +185,7 @@ struct Silence {
 struct Run {
     vector<InterceptionKeyStroke> forwarded;
     vector<InterceptionDevice> devices;
+    string output;
     int exit_code;
 };
 
@@ -234,12 +239,14 @@ ScriptedStroke on(InterceptionDevice device, const InterceptionKeyStroke &stroke
 
 Run run_blockkey(const vector<string> &arguments,
                  const vector<ScriptedStroke> &strokes,
-                 const map<InterceptionDevice, wstring> &ids = map<InterceptionDevice, wstring>()) {
+                 const map<InterceptionDevice, wstring> &ids = map<InterceptionDevice, wstring>(),
+                 bool lock_available = true) {
     Silence silence;
 
     script = strokes;
     hardware_ids = ids;
     script_position = 0;
+    single_program_available = lock_available;
     forwarded.clear();
     forwarded_devices.clear();
 
@@ -255,6 +262,7 @@ Run run_blockkey(const vector<string> &arguments,
     result.exit_code = blockkey_main((int)argv.size(), &argv[0]);
     result.forwarded = forwarded;
     result.devices = forwarded_devices;
+    result.output = silence.buffer.str();
 
     return result;
 }
@@ -439,6 +447,68 @@ static void test_start_up_release_undoes_an_already_stuck_key() {
     CHECK(run_blockkey(releasing_args("--any-e0"), nothing).forwarded.size() == keyboards * 2);
 }
 
+static void test_release_only_frees_a_stuck_key_without_blocking() {
+    map<InterceptionDevice, wstring> no_ids;
+    vector<ScriptedStroke> strokes;
+    strokes.push_back(on(keyboard, key(scan_right_alt, e0_down_state))); /* must not be touched */
+
+    vector<string> arguments;
+    arguments.push_back("--release-only");
+    arguments.push_back("--quiet");
+
+    Run run = run_blockkey(arguments, strokes);
+
+    CHECK(run.exit_code == 0);
+    /* Both E0 variants on every keyboard, and the scripted stroke untouched. */
+    CHECK(run.forwarded.size() == (size_t)INTERCEPTION_MAX_KEYBOARD * 2);
+
+    if (run.forwarded.size() == (size_t)INTERCEPTION_MAX_KEYBOARD * 2) {
+        CHECK(run.forwarded[0].code == scan_right_alt && run.forwarded[0].state == e0_up_state);
+        CHECK(run.forwarded[1].code == scan_right_alt && run.forwarded[1].state == up_state);
+
+        for (size_t i = 0; i < run.forwarded.size(); ++i)
+            CHECK(run.forwarded[i].code == scan_right_alt);
+    }
+
+    /* It has to work while the running service holds the single program lock. */
+    Run locked = run_blockkey(arguments, strokes, no_ids, false);
+    CHECK(locked.exit_code == 0);
+    CHECK(locked.forwarded.size() == (size_t)INTERCEPTION_MAX_KEYBOARD * 2);
+
+    /* A blocking run, on the other hand, must refuse to start then. */
+    vector<string> blocking;
+    blocking.push_back("--no-release");
+
+    Run refuses = run_blockkey(blocking, strokes, no_ids, false);
+    CHECK(refuses.exit_code == 1);
+    CHECK(refuses.forwarded.empty());
+}
+
+static void test_an_unmatched_hardware_id_is_reported() {
+    map<InterceptionDevice, wstring> ids;
+    ids[keyboard] = L"ACPI\\PNP0303\\4&1A2B3C&0&Laptop-KBD";
+
+    vector<ScriptedStroke> nothing;
+
+    vector<string> unmatched;
+    unmatched.push_back("--hardware-id");
+    unmatched.push_back("nonsense");
+    unmatched.push_back("--no-release");
+
+    Run warned = run_blockkey(unmatched, nothing, ids);
+    CHECK(warned.exit_code == 0);
+    CHECK(warned.output.find("nothing will be swallowed") != string::npos);
+
+    vector<string> matched;
+    matched.push_back("--hardware-id");
+    matched.push_back("laptop");
+    matched.push_back("--no-release");
+
+    Run silent = run_blockkey(matched, nothing, ids);
+    CHECK(silent.exit_code == 0);
+    CHECK(silent.output.find("nothing will be swallowed") == string::npos);
+}
+
 static void test_bad_arguments_are_rejected() {
     Run unknown = run_blockkey(blocking_args("--nonsense"), vector<ScriptedStroke>());
     CHECK(unknown.exit_code == 2);
@@ -465,6 +535,8 @@ int main() {
     test_probe_swallows_nothing();
     test_list_only_reports_devices();
     test_start_up_release_undoes_an_already_stuck_key();
+    test_release_only_frees_a_stuck_key_without_blocking();
+    test_an_unmatched_hardware_id_is_reported();
     test_bad_arguments_are_rejected();
 
     cout << (checks - failures) << "/" << checks << " checks passed" << endl;

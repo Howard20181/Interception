@@ -21,7 +21,8 @@
  *
  * Quit at any time with left Ctrl + left Shift + Q.  A service, which has no
  * console and no keyboard of its own, is stopped with "sc stop blockkey"
- * instead.
+ * instead, and writes what it does to the Windows event log rather than to a
+ * file of its own.
  */
 
 #include <cstdlib>
@@ -78,6 +79,7 @@ struct Options {
     int device;             /* 0: every keyboard, otherwise 1..INTERCEPTION_MAX_KEYBOARD */
     wstring hardware_id;    /* empty: every keyboard */
     bool release;           /* release the key once at start up */
+    bool release_only;      /* send that release and exit, swallow nothing */
     bool service;           /* run under the service control manager */
     bool list;
     bool probe;
@@ -92,6 +94,7 @@ Options default_options() {
     options.device = 0;
     options.hardware_id.clear();
     options.release = true;
+    options.release_only = false;
     options.service = false;
     options.list = false;
     options.probe = false;
@@ -170,9 +173,16 @@ bool device_matches(const Options &options, InterceptionDevice device,
     return contains_case_insensitive(hardware_id.c_str(), options.hardware_id);
 }
 
+string number_text(unsigned long number) {
+    ostringstream text;
+
+    text << number;
+
+    return text.str();
+}
+
 /* Key up strokes that undo the configured key, one per E0 variant. */
-vector<InterceptionKeyStroke> release_strokes(const Options &options) {
-    vector<InterceptionKeyStroke> strokes;
+vector<InterceptionKeyStroke> release_strokes(const Options &options) {    vector<InterceptionKeyStroke> strokes;
 
     if (options.e0 != e0_no) {
         InterceptionKeyStroke stroke = {options.code, INTERCEPTION_KEY_UP | INTERCEPTION_KEY_E0, 0};
@@ -204,6 +214,38 @@ int release_target_key(InterceptionContext context, const Options &options) {
             ++keyboards;
 
     return keyboards;
+}
+
+/* Emergency stop for a modifier that a broken key left stuck: Windows then
+ * believes Alt is still held, which turns Enter in a console window into
+ * Alt+Enter and toggles fullscreen instead of running the command.  This sends
+ * the key up once and exits, swallowing nothing, so it also works while the
+ * service is running and needs no working keyboard of its own. */
+int release_stuck_key(const Options &options) {
+    Options release = options;
+    InterceptionContext context;
+    int keyboards;
+
+    /* Both E0 variants, whichever variant was configured as the target. */
+    release.e0 = e0_any;
+    release.service = false;
+
+    context = interception_create_context();
+    if (!context) {
+        cerr << "blockkey: cannot reach the Interception driver; install it and run this"
+                " program as administrator" << endl;
+        return 1;
+    }
+
+    keyboards = release_target_key(context, release);
+
+    interception_destroy_context(context);
+
+    if (!options.quiet)
+        cout << "blockkey: sent the key up to " << number_text((unsigned long)keyboards)
+             << " keyboard device(s); a stuck key should be released now" << endl;
+
+    return 0;
 }
 
 struct HardwareIdCache {
@@ -325,6 +367,8 @@ void print_usage(ostream &out) {
         << "  --hardware-id <text>  act only on keyboards whose hardware id contains it\n"
         << "  --release             release the key once at start up (default)\n"
         << "  --no-release          never send anything, only swallow\n"
+        << "  --release-only        send the key up once and exit: clears a modifier\n"
+        << "                        that a broken key left stuck down\n"
         << "  --probe               print every keystroke and swallow nothing\n"
         << "  --list                list the keyboard devices, then exit\n"
         << "  --service             run as a Windows service, started by the service\n"
@@ -400,6 +444,8 @@ int parse_options(int argc, char *argv[], Options &options) {
             options.release = true;
         } else if (argument == "--no-release") {
             options.release = false;
+        } else if (argument == "--release-only") {
+            options.release_only = true;
         } else if (argument == "--probe") {
             options.probe = true;
         } else if (argument == "--verbose") {
@@ -417,6 +463,45 @@ int parse_options(int argc, char *argv[], Options &options) {
     return 0;
 }
 
+/* --------------------------------------------------------- event log -- */
+
+/* Message ids defined in blockkey.mc, which is compiled into the executable
+ * and registered as the event source by install-service.cmd. */
+enum EventId {
+    event_information = 1,
+    event_warning     = 2,
+    event_error       = 3
+};
+
+const char *event_source_name = "blockkey";
+
+/* Opened once per service run; 0 when the event log cannot be used. */
+HANDLE event_source = 0;
+
+bool open_event_source() {
+    if (event_source) return true;
+
+    event_source = RegisterEventSourceA(0, event_source_name);
+
+    return event_source != 0;
+}
+
+void close_event_source() {
+    if (event_source) DeregisterEventSource(event_source);
+
+    event_source = 0;
+}
+
+bool report_event(WORD type, DWORD id, const string &text) {
+    LPCSTR strings[1];
+
+    if (!event_source) return false;
+
+    strings[0] = text.c_str();
+
+    return ReportEventA(event_source, type, 0, id, 0, 1, 0, strings, 0) != 0;
+}
+
 /* ------------------------------------------------------------ logging -- */
 
 string timestamp() {
@@ -430,7 +515,8 @@ string timestamp() {
     return string(text);
 }
 
-/* A service has no console, so its few messages go to this file instead. */
+/* Only used when a service cannot reach the event log, which is what Windows
+ * normally journals for us, keeping the log size under system control. */
 string log_file_path() {
     char program_data[MAX_PATH];
     DWORD length = GetEnvironmentVariableA("ProgramData", program_data, sizeof(program_data));
@@ -442,14 +528,6 @@ string log_file_path() {
     CreateDirectoryA(directory.c_str(), 0);
 
     return directory + "\\blockkey.log";
-}
-
-string number_text(unsigned long number) {
-    ostringstream text;
-
-    text << number;
-
-    return text.str();
 }
 
 /* Everything the stroke handling needs, shared by the console loop and the
@@ -468,14 +546,56 @@ struct Session {
     }
 
     void log(const string &line) {
-        if (options.service) {
-            ofstream file(log_file_path().c_str(), ios::app);
-            if (file) file << timestamp() << " " << line << endl;
-        } else if (!options.quiet) {
-            cout << line << endl;
+        write_line(EVENTLOG_INFORMATION_TYPE, event_information, line);
+    }
+
+    void log_warning(const string &line) {
+        write_line(EVENTLOG_WARNING_TYPE, event_warning, line);
+    }
+
+    void log_error(const string &line) {
+        write_line(EVENTLOG_ERROR_TYPE, event_error, line);
+    }
+
+    void write_line(WORD type, DWORD id, const string &line) {
+        if (!options.service) {
+            if (!options.quiet) cout << line << endl;
+
+            return;
         }
+
+        if (report_event(type, id, line)) return;
+
+        /* The event log is normally there, this only keeps the messages when
+         * it is not. */
+        ofstream file(log_file_path().c_str(), ios::app);
+        if (file) file << timestamp() << " " << line << endl;
     }
 };
+
+/* Would any keyboard at all be affected by the configured filter?  A hardware
+ * id that matches nothing looks exactly like a working setup that swallows
+ * nothing, so it is worth saying out loud. */
+bool any_keyboard_matches(InterceptionContext context, const Options &options,
+                          HardwareIdCache &cache) {
+    for (int number = 1; number <= INTERCEPTION_MAX_KEYBOARD; ++number) {
+        InterceptionDevice device = INTERCEPTION_KEYBOARD(number - 1);
+
+        if (device_matches(options, device, hardware_id_of(context, device, cache)))
+            return true;
+    }
+
+    return false;
+}
+
+void warn_about_unmatched_keyboard(Session &session) {
+    if (session.options.probe) return;
+    if (session.options.hardware_id.empty() && session.options.device == 0) return;
+    if (any_keyboard_matches(session.context, session.options, session.cache)) return;
+
+    session.log_warning("no keyboard matches the configured --hardware-id/--device,"
+                        " so nothing will be swallowed");
+}
 
 /* ------------------------------------------------------------- stroke -- */
 
@@ -589,9 +709,13 @@ void WINAPI service_main(DWORD argc, char **argv) {
 
     report_service_status(SERVICE_START_PENDING, NO_ERROR);
 
+    /* From here on, everything worth knowing goes to the event log. */
+    open_event_source();
+
     service_stop_event = CreateEventA(0, TRUE, FALSE, 0);
     if (!service_stop_event) {
         report_service_status(SERVICE_STOPPED, GetLastError());
+        close_event_source();
         return;
     }
 
@@ -599,10 +723,11 @@ void WINAPI service_main(DWORD argc, char **argv) {
 
     service_session.context = interception_create_context();
     if (!service_session.context) {
-        service_session.log("cannot reach the Interception driver");
+        service_session.log_error("cannot reach the Interception driver");
         report_service_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
         CloseHandle(service_stop_event);
         service_stop_event = 0;
+        close_event_source();
         return;
     }
 
@@ -610,6 +735,8 @@ void WINAPI service_main(DWORD argc, char **argv) {
 
     interception_set_filter(service_session.context, interception_is_keyboard,
                             INTERCEPTION_FILTER_KEY_ALL);
+
+    warn_about_unmatched_keyboard(service_session);
 
     if (service_session.options.release)
         service_session.log(
@@ -632,6 +759,8 @@ void WINAPI service_main(DWORD argc, char **argv) {
     service_stop_event = 0;
 
     report_service_status(SERVICE_STOPPED, NO_ERROR);
+
+    close_event_source();
 }
 
 int run_as_service(const Options &options) {
@@ -642,9 +771,12 @@ int run_as_service(const Options &options) {
     service_session.options.service = true;
     service_session.options.quiet = true;
 
+    /* Nothing is journalled from here: only service_main(), which the service
+     * control manager calls, writes to the event log.  Started by hand from a
+     * command line, this reports to stderr and touches no log at all. */
     program_instance = try_open_single_program(single_program_name);
     if (!program_instance) {
-        service_session.log("cannot start, another instance is already running");
+        cerr << "blockkey: another instance is already running" << endl;
         return 1;
     }
 
@@ -657,9 +789,10 @@ int run_as_service(const Options &options) {
         DWORD error = GetLastError();
 
         if (error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
-            service_session.log("--service must be started by the service control manager");
+            cerr << "blockkey: --service must be started by the service control manager"
+                 << endl;
         else
-            service_session.log("cannot start as a service, error " + number_text(error));
+            cerr << "blockkey: cannot start as a service, error " << error << endl;
 
         close_single_program(program_instance);
 
@@ -685,6 +818,8 @@ int main(int argc, char *argv[]) {
         print_usage(cerr);
         return 2;
     }
+
+    if (options.release_only) return release_stuck_key(options);
 
     if (options.service) return run_as_service(options);
 
@@ -723,6 +858,8 @@ int main(int argc, char *argv[]) {
         session.log("blockkey: swallowing " + describe_target(options));
 
     session.log("blockkey: quit with left Ctrl + left Shift + Q");
+
+    warn_about_unmatched_keyboard(session);
 
     if (options.release && !options.probe)
         session.log("blockkey: released the key on " +
